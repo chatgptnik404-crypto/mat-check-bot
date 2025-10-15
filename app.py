@@ -47,33 +47,47 @@ async def tg_get_file_path(file_id: str) -> str:
 # --------------- OpenAI Vision --------------
 async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> dict:
     """
-    Передаёт в OpenAI прямую **ссылку** на картинку (без base64) и получает JSON.
+    Передаёт прямой URL изображения в OpenAI и получает строгий JSON.
+    Логика: прочитать финальный ответ ученика, решить задачу заново, сравнить,
+    найти только реальные ошибки хода (если есть), решать неуверенность честно.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
     system_prompt = (
-        "Ты — учитель математики 7–9 классов. Тебе приходит фото тетради. "
-        "Твоя задача: аккуратно прочитать запись, ПЕРЕрешить задачи самостоятельно и сравнить с тем, "
-        "что написано учеником. Если видимость плохая — не угадывай цифры, а пиши, что неразборчиво. "
-        "Никогда не выдумывай ошибки, если не уверен. Отвечай строго в JSON."
+        "Ты — строгий и доброжелательный учитель математики 7–9 классов. "
+        "Правила:\n"
+        "1) Аккуратно считай, что написал ученик: выпиши ЕГО финальный ответ (если виден).\n"
+        "2) Независимо реши задачу сам и получи СВОЙ финальный ответ.\n"
+        "3) Сравни: если ответы совпадают (учитывай разумную погрешность для десятичных: 1e-3 или 1%), то итог ВЕРНЫЙ.\n"
+        "4) Отмечай только РЕАЛЬНЫЕ ошибки хода (например, пропуск шага, неверное преобразование). Если хода решения не видно — не выдумывай.\n"
+        "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку и не придумывай ошибки.\n"
+        "6) Если что-то неразборчиво — честно укажи это и не утверждай про ошибки.\n"
+        "7) Пиши строго в JSON указанного формата."
     )
     if grade_label:
-        system_prompt += f" Класс/тема: {grade_label}."
+        system_prompt += f" Контекст: {grade_label}."
 
     user_prompt = (
-        "Верни JSON ровно такого вида:\n"
+        "Верни РОВНО такой JSON (без лишнего текста):\n"
         "{\n"
-        '  "confidence": 0.0..1.0,  // оценка уверенности в распознавании записи ученика\n'
-        '  "steps": ["шаг 1", "шаг 2", "..."],\n'
-        '  "mistakes": [{"where":"...", "type":"...", "why":"..."}],\n'
-        '  "gaps": ["..."],\n'
-        '  "drills": ["задача 1", "задача 2", "задача 3"],\n'
-        '  "summary": "1–2 предложения: что подтянуть"\n'
+        '  "confidence": 0.0,                   // 0..1 — уверенность, что запись ученика прочитана верно\n'
+        '  "student_final_answer": null,        // строка/число, финальный ответ ученика, если прочитал; иначе null\n'
+        '  "model_final_answer": null,          // твой рассчитанный ответ (строка/число)\n'
+        '  "is_final_answer_correct": null,     // true/false, а если не удалось прочитать — null\n'
+        '  "steps_student": [],                 // краткая реконструкция шагов ученика, если видны\n'
+        '  "step_issues": [                     // реальные ошибки/недочёты хода, если есть\n'
+        '    {"step": "…", "type": "…", "why": "…"}\n'
+        '  ],\n'
+        '  "gaps": [],                          // вероятные пробелы только если есть ошибки\n'
+        '  "need_drills": false,                // предлагать ли мини-тренировку\n'
+        '  "drills": [],                        // 0–3 задания, только если need_drills=true\n'
+        '  "summary": "…"                       // короткий вывод по делу\n'
         "}\n"
-        "Правила: 1) Сначала реши задачу сам. 2) Сравни со строками ученика. "
-        "3) Если запись цифры неуверенно читается, отметь в mistakes тип 'неразборчиво' и не утверждай ошибку. "
-        "4) Если всё верно — укажи, что ошибок нет."
+        "Уточнения:\n"
+        "- Итог «верно», если твой ответ совпадает с ученическим (целые — строго, десятичные — погрешность до 1e-3 или 1%).\n"
+        "- Если ответ верный и step_issues пуст — поставь need_drills=false и не пиши drills.\n"
+        "- Если не уверен в чтении цифр — укажи это в summary, оставь is_final_answer_correct = null, не придумывай ошибки."
     )
 
     headers = {
@@ -81,9 +95,8 @@ async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> di
         "Content-Type": "application/json",
     }
 
-    # ВАЖНО: image_url — ОБЪЕКТ {"url": "..."}; отдаём ПРЯМОЙ URL Telegram (без base64)
     payload = {
-        "model": OPENAI_MODEL,
+        "model": OPENAI_MODEL,          # gpt-4o-mini или gpt-4o
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -95,15 +108,12 @@ async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> di
             },
         ],
         "temperature": 0.0,
-        "max_tokens": 350,  # держим коротко и дёшево
+        "max_tokens": 320,              # держим короче и дешевле
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
+        r = await client.post("https://api.openai.com/v1/chat/completions",
+                              headers=headers, json=payload)
         if r.status_code != 200:
             print("OpenAI ERROR", r.status_code, r.text)
         r.raise_for_status()
@@ -120,64 +130,86 @@ async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> di
             print("JSON parse failed. Raw:", (raw or "")[:500])
             return {
                 "confidence": 0.0,
-                "steps": [],
-                "mistakes": [],
+                "student_final_answer": None,
+                "model_final_answer": None,
+                "is_final_answer_correct": None,
+                "steps_student": [],
+                "step_issues": [],
                 "gaps": [],
+                "need_drills": False,
                 "drills": [],
-                "summary": "Не удалось распарсить ответ модели. Попробуйте переснять фото."
+                "summary": "Не удалось надёжно распознать запись. Переснимите крупнее/резче."
             }
-
-
 # --------------- Formatting -----------------
 def format_report(j: dict) -> str:
-    conf = j.get("confidence")
-    steps = j.get("steps") or []
-    mistakes = j.get("mistakes") or []
-    gaps = j.get("gaps") or []
+    conf  = j.get("confidence")
+    s_ans = j.get("student_final_answer")
+    m_ans = j.get("model_final_answer")
+    ok    = j.get("is_final_answer_correct")
+    steps = j.get("steps_student") or []
+    issues = j.get("step_issues") or []
+    gaps   = j.get("gaps") or []
+    need   = bool(j.get("need_drills"))
     drills = j.get("drills") or []
     summary = j.get("summary") or ""
 
-    lines = []
+    out = []
+
+    # заголовок: верно/неверно/неопределённо
+    if ok is True:
+        out.append("✅ Итоговый ответ: ВЕРНО.")
+    elif ok is False:
+        out.append("❌ Итоговый ответ: НЕВЕРНО.")
+    else:
+        out.append("⚠️ Не удалось надёжно прочитать финальный ответ ученика.")
+
+    # финальные ответы
+    if s_ans is not None:
+        out.append(f"Ответ ученика: {s_ans}")
+    if m_ans is not None:
+        out.append(f"Проверочный ответ: {m_ans}")
+
+    # уверенность OCR
     if isinstance(conf, (int, float)):
-        lines.append(f"Уверенность распознавания: {round(float(conf)*100)}%")
-        lines.append("")
+        out.append(f"Уверенность распознавания: {round(float(conf)*100)}%")
+    out.append("")
 
+    # шаги ученика (если есть)
     if steps:
-        lines.append("Шаги решения:")
+        out.append("Шаги ученика (как читаются с фото):")
         for i, s in enumerate(steps, 1):
-            lines.append(f"{i}) {s}")
-        lines.append("")
+            out.append(f"{i}) {s}")
+        out.append("")
 
-    if mistakes:
-        lines.append("Ошибки:")
-        for m in mistakes:
-            where = m.get("where", "—")
+    # реальные недочёты хода
+    if issues:
+        out.append("Ошибки/недочёты хода решения:")
+        for m in issues:
+            step = m.get("step", "—")
             mtype = m.get("type", "—")
             why = m.get("why", "")
-            lines.append(f"• {where}: {mtype}. {why}")
-        lines.append("")
-    else:
-        lines.append("Ошибок не найдено или запись плохо читается.")
-        lines.append("")
+            out.append(f"• {step}: {mtype}. {why}")
+        out.append("")
 
-    if gaps:
-        lines.append("Вероятные пробелы:")
+    # пробелы — только если есть ошибки
+    if issues and gaps:
+        out.append("Вероятные пробелы:")
         for g in gaps:
-            lines.append(f"• {g}")
-        lines.append("")
+            out.append(f"• {g}")
+        out.append("")
 
-    if drills:
-        lines.append("Мини-тренировка (3 задания):")
+    # мини-тренировка — только если need_drills == True
+    if need and drills:
+        out.append("Мини-тренировка:")
         for d in drills:
-            lines.append(f"• {d}")
-        lines.append("")
+            out.append(f"• {d}")
+        out.append("")
 
     if summary:
-        lines.append(f"Итог: {summary}")
+        out.append(f"Итог: {summary}")
 
-    msg = "\n".join(lines).strip()
+    msg = "\n".join(out).strip()
     return msg[:4000] if len(msg) > 4000 else msg
-
 
 # ----------------- Routes -------------------
 @app.get("/")

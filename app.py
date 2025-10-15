@@ -1,4 +1,4 @@
-# app.py
+# app1.py
 import os
 import io
 import json
@@ -10,14 +10,14 @@ from typing import Optional
 
 from fastapi import FastAPI, Request
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
 
-# Жёсткие настройки по твоей просьбе:
+# Жёсткие настройки по просьбе:
 MAX_SIDE = int(os.getenv("MAX_SIDE", "640"))         # px (длинная сторона)
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))  # 60 как просил
 
@@ -29,9 +29,7 @@ app = FastAPI()
 DOWNLOAD_DIR = Path("/tmp/tg_photos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Память для анти-дубликатов (message_id) на короткое время:
-SEEN = {}  # message_id -> timestamp
-
+SEEN = {}  # message_id -> timestamp (анти-дубль)
 
 # ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
@@ -67,45 +65,52 @@ async def tg_download_file(file_path: str) -> Path:
         local.write_bytes(r.content)
     return local
 
-
 # --------------- Image helpers --------------
+def _trim_whitespace(img_l: Image.Image, thresh: int = 245) -> Image.Image:
+    """Обрезаем пустые поля (почти белые)."""
+    bw = img_l.point(lambda p: 255 if p > thresh else 0, mode="L")
+    bbox = bw.getbbox()
+    return img_l.crop(bbox) if bbox else img_l
+
 def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
     """
-    Открывает картинку, переводит в grayscale, мягко сжимает
-    (длинная сторона <= max_side), слегка поднимает контраст,
-    сохраняет в JPEG и возвращает base64-строку (ascii).
-    Пишет подробный лог [IMG] … для контроля размеров.
+    Грейскейл → обрезка полей → лёгкий шумоподавитель → autocontrast →
+    unsharp → ресайз до max_side → JPEG(Q), optimize+progressive → base64.
+    Делает запись максимально читаемой и дешёвой по токенам.
     """
-    img = Image.open(path).convert("L")  # grayscale (экономит токены)
-    w, h = img.size
-    scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
+    img = Image.open(path).convert("L")
+    w0, h0 = img.size
+
+    # обрезаем «поля»
+    img = _trim_whitespace(img, thresh=245)
+    w1, h1 = img.size
+
+    # лёгкое шумоподавление (не мажем сильно)
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+
+    # нормализуем контраст
+    img = ImageOps.autocontrast(img, cutoff=1)
+
+    # усилим штрихи
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=120, threshold=3))
+
+    # масштабируем
+    scale = max(w1, h1) / max_side if max(w1, h1) > max_side else 1.0
     if scale > 1.0:
-        img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+        img = img.resize((int(w1/scale), int(h1/scale)), Image.LANCZOS)
 
-    # лёгкое повышение контраста (помогает OCR/читаемости)
-    img = img.point(lambda p: min(255, int(p * 1.15)))
-
+    # сохраняем в JPEG максимально компактно
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
     jpeg_bytes = buf.getvalue()
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
 
-    # ЛОГИ по картинке
-    print(f"[IMG] resized {w}x{h} -> {img.size[0]}x{img.size[1]}, jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}")
+    print(f"[IMG] original {w0}x{h0} -> trimmed {w1}x{h1} -> resized {img.size[0]}x{img.size[1]}, "
+          f"jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}, MAX_SIDE={max_side}, Q={quality}")
     return b64
-
 
 # --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
-    """
-    Анализ фото тетради (с предварительным сжатием). Возвращает строгий JSON.
-    Логика:
-      1) считать финальный ответ ученика (если виден),
-      2) решить задачу заново,
-      3) сравнить (целые строго; десятичные — погрешность до 1e-3 или 1%),
-      4) перечислить только реальные недочёты шага,
-      5) не предлагать тренировку, если всё верно и без ошибок.
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
@@ -114,13 +119,13 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     system_prompt = (
         "Ты — строгий и доброжелательный учитель математики 7–9 классов. "
         "Правила:\n"
-        "1) Аккуратно прочитай запись ученика и выпиши ЕГО финальный ответ (если виден).\n"
-        "2) Сам реши задачу заново и получи СВОЙ финальный ответ.\n"
-        "3) Сравни: если ответы совпадают (целые — строго, десятичные — с погрешностью 1e-3 или 1%), итог ВЕРНЫЙ.\n"
-        "4) Указывай только РЕАЛЬНЫЕ ошибки/недочёты хода (неразборчиво ≠ ошибка).\n"
+        "1) Считай финальный ответ ученика (если виден).\n"
+        "2) Сам реши задачу заново и получи свой финальный ответ.\n"
+        "3) Сравни: целые строго; десятичные с погрешностью 1e-3 или 1%.\n"
+        "4) Указывай только РЕАЛЬНЫЕ недочёты шага (неразборчиво ≠ ошибка).\n"
         "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку.\n"
-        "6) Если видимость плохая — честно укажи это и не придумывай ошибок.\n"
-        "7) Ответ только в JSON."
+        "6) Если видимость плохая — честно укажи это и не придумывай ошибки.\n"
+        "7) Ответ строго в JSON."
     )
     if grade_label:
         system_prompt += f" Контекст: {grade_label}."
@@ -139,7 +144,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         '  "drills": [],\n'
         '  "summary": "…"\n'
         "}\n"
-        "Если итог верный и нет ошибок хода — need_drills=false и drills пустой."
+        "Если итог верный и нет ошибок хода — need_drills=false и drills пуст."
     )
 
     headers = {
@@ -154,9 +159,13 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
             {
                 "role": "user",
                 "content": [
-                    {  # СЖАТОЕ изображение в data-URL
+                    {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                        # КРИТИЧНО: дешёвый режим токенизации изображения
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}",
+                            "detail": "low"
+                        },
                     },
                     {"type": "text", "text": user_prompt},
                 ],
@@ -180,14 +189,15 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         r.raise_for_status()
         data = r.json()
 
-    # usage-лог
     try:
         usage = data.get("usage", {})
-        print(f"[AI] usage: prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} total={usage.get('total_tokens')} time={(time.time()-start_ts):.2f}s")
+        print(f"[AI] usage: prompt={usage.get('prompt_tokens')} "
+              f"completion={usage.get('completion_tokens')} total={usage.get('total_tokens')} "
+              f"time={(time.time()-start_ts):.2f}s")
     except Exception:
         pass
 
-    # парсинг JSON-ответа модели
+    # парсинг JSON-ответа
     try:
         raw = data["choices"][0]["message"]["content"]
         return json.loads(raw)
@@ -209,7 +219,6 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
                 "drills": [],
                 "summary": "Не удалось надёжно распознать запись. Переснимите крупнее/резче."
             }
-
 
 # --------------- Formatting -----------------
 def format_report(j: dict) -> str:
@@ -273,7 +282,6 @@ def format_report(j: dict) -> str:
     msg = "\n".join(out).strip()
     return msg[:4000] if len(msg) > 4000 else msg
 
-
 # ----------------- Routes -------------------
 @app.get("/")
 def health():
@@ -291,14 +299,12 @@ async def tg_webhook(request: Request):
             text = message.get("text") or ""
             photos = message.get("photo") or []
 
-            # простая защёлка от дубликатов
             now = time.time()
             if message_id in SEEN and now - SEEN[message_id] < 60:
                 print(f"[DEDUP] skip message_id {message_id}")
                 return {"ok": True}
             SEEN[message_id] = now
 
-            # /start
             if text.startswith("/start"):
                 hello = (
                     "Привет! Отправь фото задачи (лучше по одной на фото). "
@@ -308,7 +314,6 @@ async def tg_webhook(request: Request):
                 await tg_send_message(chat_id, hello, reply_to=message_id)
                 return {"ok": True}
 
-            # Фото
             if photos:
                 largest = photos[-1]
                 file_id = largest["file_id"]
@@ -336,18 +341,11 @@ async def tg_webhook(request: Request):
                     )
                 return {"ok": True}
 
-            # Эхо
             if text:
                 await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
                 return {"ok": True}
 
             await tg_send_message(chat_id, "Пришли /start или отправь фото.")
-            return {"ok": True}
-
-        # callback_query — на будущее
-        if update.get("callback_query"):
-            chat_id = update["callback_query"]["message"]["chat"]["id"]
-            await tg_send_message(chat_id, "Кнопка нажата.")
             return {"ok": True}
 
         return {"ok": True}

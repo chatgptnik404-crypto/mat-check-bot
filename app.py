@@ -3,8 +3,8 @@ import os
 import io
 import json
 import base64
-import traceback
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -16,8 +16,8 @@ from PIL import Image
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))            # px (длинная сторона)
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))      # 80–90 норм
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))            # px длинная сторона (экономно)
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))      # 75–85 ок
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -26,6 +26,9 @@ FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 app = FastAPI()
 DOWNLOAD_DIR = Path("/tmp/tg_photos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# простая защёлка от дублей одного апдейта
+SEEN: dict[int, float] = {}  # message_id -> ts
 
 # ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
@@ -62,15 +65,18 @@ async def tg_download_file(file_path: str) -> Path:
     return local
 
 # --------------- Image helpers --------------
-
 def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
-    img = Image.open(path).convert("L")  # grayscale: экономнее токены
-    w, h = img.size
-    scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
+    """
+    Сжимаем: переводим в градации серого, уменьшаем до max_side,
+    слегка поднимаем контраст, сохраняем JPEG и отдаем base64.
+    """
+    img = Image.open(path).convert("L")  # grayscale экономит токены
+    w0, h0 = img.size
+    scale = max(w0, h0) / max_side if max(w0, h0) > max_side else 1.0
     if scale > 1.0:
-        img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+        img = img.resize((int(w0/scale), int(h0/scale)), Image.LANCZOS)
 
-    # лёгкое повышение контраста: помогает OCR на малом размере
+    # лёгкий контраст — помогает OCR на меньшем размере
     img = img.point(lambda p: min(255, int(p * 1.15)))
 
     buf = io.BytesIO()
@@ -78,43 +84,39 @@ def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = J
     jpeg_bytes = buf.getvalue()
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
 
-    # ЛОГИ
-    print(f"[IMG] resized {w}x{h} -> {img.size[0]}x{img.size[1]}, jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}")
-
+    print(f"[IMG] resized {w0}x{h0} -> {img.size[0]}x{img.size[1]}, "
+          f"jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}")
     return b64
-
 
 # --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     """
-    Анализ фото тетради (с предварительным сжатием). Возвращает строгий JSON.
+    Анализ фото тетради (со сжатием в base64). Возвращает строгий JSON.
     Логика:
-      1) считать финальный ответ ученика (если виден),
-      2) решить задачу заново,
-      3) сравнить (целые строго; десятичные — погрешность до 1e-3 или 1%),
+      1) прочитать финальный ответ ученика (если виден),
+      2) решить заново,
+      3) сравнить (целые строго; десятичные — 1e-3 или 1%),
       4) перечислить только реальные недочёты шага,
-      5) не предлагать тренировку, если всё верно и без ошибок.
+      5) не давать тренировку, если всё верно и без ошибок.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
     img_b64 = downscale_to_jpeg_b64(image_path, MAX_SIDE, JPEG_QUALITY)
-    start_ts = time.time()
-print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, sending image_b64_len={len(img_b64)}")
 
     system_prompt = (
-        "Ты — строгий и доброжелательный учитель математики 7–9 классов. "
+        "Ты — строгий и доброжелательный учитель математики 7–9 классов.\n"
         "Правила:\n"
         "1) Аккуратно прочитай запись ученика и выпиши ЕГО финальный ответ (если виден).\n"
         "2) Сам реши задачу заново и получи СВОЙ финальный ответ.\n"
         "3) Сравни: если ответы совпадают (целые — строго, десятичные — с погрешностью 1e-3 или 1%), итог ВЕРНЫЙ.\n"
         "4) Указывай только РЕАЛЬНЫЕ ошибки/недочёты хода (неразборчиво ≠ ошибка).\n"
-        "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку.\n"
-        "6) Если видимость плохая — честно укажи это и не придумывай ошибок.\n"
-        "7) Ответ только в JSON."
+        "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку и не придумывай ошибок.\n"
+        "6) Если видимость плохая — честно укажи это и не утверждай про ошибки.\n"
+        "7) Ответ только в JSON.\n"
     )
     if grade_label:
-        system_prompt += f" Контекст: {grade_label}."
+        system_prompt += f"Контекст: {grade_label}.\n"
 
     user_prompt = (
         "Верни РОВНО такой JSON:\n"
@@ -128,9 +130,10 @@ print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, sending image_b64_l
         '  "gaps": [],\n'
         '  "need_drills": false,\n'
         '  "drills": [],\n'
-        '  "summary": "…"\n"
+        '  "summary": "…"\n'
         "}\n"
-        "Если итог верный и нет ошибок хода — need_drills=false и drills пустой."
+        "Если итог верный и нет ошибок хода — need_drills=false и drills пуст.\n"
+        "Если запись неразборчива — укажи это в summary и не придумывай ошибки."
     )
 
     headers = {
@@ -139,16 +142,14 @@ print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, sending image_b64_l
     }
 
     payload = {
-        "model": OPENAI_MODEL,
+        "model": OPENAI_MODEL,  # gpt-4o-mini / gpt-4o
         "messages": [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
-                    {  # СЖАТОЕ изображение в data-URL
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                    },
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                     {"type": "text", "text": user_prompt},
                 ],
             },
@@ -157,22 +158,25 @@ print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, sending image_b64_l
         "max_tokens": 300,
     }
 
+    start_ts = time.time()
+    print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, image_b64_len={len(img_b64)}")
+
     async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
+        r = await client.post("https://api.openai.com/v1/chat/completions",
+                              headers=headers, json=payload)
         if r.status_code != 200:
             print("OpenAI ERROR", r.status_code, r.text)
         r.raise_for_status()
         data = r.json()
+
     try:
         usage = data.get("usage", {})
-        print(f"[AI] usage: prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} total={usage.get('total_tokens')} time={(time.time()-start_ts):.2f}s")
+        print(f"[AI] usage: prompt={usage.get('prompt_tokens')} "
+              f"completion={usage.get('completion_tokens')} "
+              f"total={usage.get('total_tokens')} "
+              f"time={(time.time()-start_ts):.2f}s")
     except Exception:
         pass
-
 
     try:
         raw = data["choices"][0]["message"]["content"]
@@ -270,21 +274,17 @@ async def tg_webhook(request: Request):
         update = await request.json()
         message = update.get("message") or update.get("edited_message")
         if message:
-            mid = message.get("message_id")
-            now = time.time()
-            # если в последние 60 секунд уже обрабатывали этот message_id — выходим
-            if mid in SEEN and now - SEEN[mid] < 60:
-                print(f"[DEDUP] skip message_id {mid}")
-                return {"ok": True}
-            SEEN[mid] = now
-    try:
-        update = await request.json()
-        message = update.get("message") or update.get("edited_message")
-        if message:
             chat_id = message["chat"]["id"]
             message_id = message.get("message_id")
             text = message.get("text") or ""
             photos = message.get("photo") or []
+
+            # защитимся от дублей
+            now = time.time()
+            if message_id in SEEN and now - SEEN[message_id] < 60:
+                print(f"[DEDUP] skip message_id {message_id}")
+                return {"ok": True}
+            SEEN[message_id] = now
 
             # /start
             if text.startswith("/start"):
@@ -317,13 +317,14 @@ async def tg_webhook(request: Request):
                 except Exception as e:
                     print("Analysis error:", e)
                     print(traceback.format_exc())
-                    await tg_send_message(chat_id,
+                    await tg_send_message(
+                        chat_id,
                         "Не удалось проанализировать фото 😕\n"
                         "Сделай снимок ближе и чётче, по одному заданию на фото."
                     )
                 return {"ok": True}
 
-            # Эхо для текстов (чтобы видеть, что бот жив)
+            # Эхо для текстов
             if text:
                 await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
                 return {"ok": True}

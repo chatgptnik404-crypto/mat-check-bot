@@ -3,42 +3,35 @@ import os
 import io
 import json
 import base64
-import time
-import asyncio
 import traceback
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from fastapi import FastAPI, Request
 import httpx
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
 
-# Профили сжатия (дешёвый и «спасательный» дорогой)
-LOW_MAX_SIDE = 640
-LOW_JPEG_Q   = 60
-LOW_DETAIL   = "low"
-
-HIGH_MAX_SIDE = 768
-HIGH_JPEG_Q   = 72
-HIGH_DETAIL   = "high"
+# Жёсткие настройки по твоей просьбе:
+MAX_SIDE = int(os.getenv("MAX_SIDE", "640"))         # px (длинная сторона)
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))  # 60 как просил
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-APP_VERSION = "build-2025-10-16-03"
-print(f"[BOOT] {APP_VERSION} | model={OPENAI_MODEL} | LOW={LOW_MAX_SIDE}/{LOW_JPEG_Q}/{LOW_DETAIL} | HIGH={HIGH_MAX_SIDE}/{HIGH_JPEG_Q}/{HIGH_DETAIL}")
-
-# ================ APP ======================
+# ================== APP =====================
 app = FastAPI()
 DOWNLOAD_DIR = Path("/tmp/tg_photos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-SEEN: dict[int, float] = {}  # anti-dup
+# Память для анти-дубликатов (message_id) на короткое время:
+SEEN = {}  # message_id -> timestamp
+
 
 # ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
@@ -74,78 +67,86 @@ async def tg_download_file(file_path: str) -> Path:
         local.write_bytes(r.content)
     return local
 
-# ---------------- Image helpers -------------------
-def _trim_whitespace(img_l: Image.Image, thresh: int = 245) -> Image.Image:
-    bw = img_l.point(lambda p: 255 if p > thresh else 0, mode="L")
-    bbox = bw.getbbox()
-    if bbox:
-        return img_l.crop(bbox)
-    return img_l
 
-def encode_image_b64(path: Path, max_side: int, quality: int, apply_median: bool) -> Tuple[str, str]:
+# --------------- Image helpers --------------
+def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
     """
-    Возвращает (base64, лог_строка). Для высокого профиля медиан-фильтр отключаем,
-    чтобы не смазывать тонкие штрихи.
+    Открывает картинку, переводит в grayscale, мягко сжимает
+    (длинная сторона <= max_side), слегка поднимает контраст,
+    сохраняет в JPEG и возвращает base64-строку (ascii).
+    Пишет подробный лог [IMG] … для контроля размеров.
     """
-    img = Image.open(path).convert("L")
-    w0, h0 = img.size
-
-    img = _trim_whitespace(img, thresh=245)
-
-    w1, h1 = img.size
-    if apply_median:
-        img = img.filter(ImageFilter.MedianFilter(size=3))  # только в дешёвом прогоне
-
-    scale = max(w1, h1) / max_side if max(w1, h1) > max_side else 1.0
+    img = Image.open(path).convert("L")  # grayscale (экономит токены)
+    w, h = img.size
+    scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
     if scale > 1.0:
-        img = img.resize((int(w1/scale), int(h1/scale)), Image.LANCZOS)
+        img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
 
-    img = ImageOps.autocontrast(img, cutoff=1)
+    # лёгкое повышение контраста (помогает OCR/читаемости)
+    img = img.point(lambda p: min(255, int(p * 1.15)))
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     jpeg_bytes = buf.getvalue()
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
 
-    log = (f"original {w0}x{h0} -> trimmed {w1}x{h1} -> resized {img.size[0]}x{img.size[1]}, "
-           f"jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}, MAX_SIDE={max_side}, Q={quality}, "
-           f"median={'on' if apply_median else 'off'}")
-    return b64, log
+    # ЛОГИ по картинке
+    print(f"[IMG] resized {w}x{h} -> {img.size[0]}x{img.size[1]}, jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}")
+    return b64
 
-# ---------------- OpenAI call ---------------------
-async def call_openai(img_b64: str, detail: str) -> dict:
-    system_prompt = """Ты — строгий и доброжелательный учитель математики 7–9 классов.
-1) Считай финальный ответ ученика (если виден).
-2) Реши задачу сам и получи свой финальный ответ.
-3) Сравни: целые — строго; десятичные — с погрешностью 1e-3 или 1%.
-4) Указывай ТОЛЬКО реальные ошибки хода (неразборчиво ≠ ошибка).
-5) Если итог верный и ошибок хода нет — не предлагай тренировку.
-6) Если видимость плохая — честно укажи это и не придумывай ошибки.
-Ответ строго в JSON.
-"""
 
-    user_prompt = """Верни РОВНО такой JSON:
-{
-  "confidence": 0.0,
-  "student_final_answer": null,
-  "model_final_answer": null,
-  "is_final_answer_correct": null,
-  "steps_student": [],
-  "step_issues": [],
-  "gaps": [],
-  "need_drills": false,
-  "drills": [],
-  "summary": "…"
-}
-Правила вывода:
-- Если итог верный и нет ошибок хода — need_drills=false и drills пуст.
-- Если запись неразборчива — укажи это в summary и не придумывай ошибки.
-"""
+# --------------- OpenAI Vision --------------
+async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
+    """
+    Анализ фото тетради (с предварительным сжатием). Возвращает строгий JSON.
+    Логика:
+      1) считать финальный ответ ученика (если виден),
+      2) решить задачу заново,
+      3) сравнить (целые строго; десятичные — погрешность до 1e-3 или 1%),
+      4) перечислить только реальные недочёты шага,
+      5) не предлагать тренировку, если всё верно и без ошибок.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+
+    img_b64 = downscale_to_jpeg_b64(image_path, MAX_SIDE, JPEG_QUALITY)
+
+    system_prompt = (
+        "Ты — строгий и доброжелательный учитель математики 7–9 классов. "
+        "Правила:\n"
+        "1) Аккуратно прочитай запись ученика и выпиши ЕГО финальный ответ (если виден).\n"
+        "2) Сам реши задачу заново и получи СВОЙ финальный ответ.\n"
+        "3) Сравни: если ответы совпадают (целые — строго, десятичные — с погрешностью 1e-3 или 1%), итог ВЕРНЫЙ.\n"
+        "4) Указывай только РЕАЛЬНЫЕ ошибки/недочёты хода (неразборчиво ≠ ошибка).\n"
+        "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку.\n"
+        "6) Если видимость плохая — честно укажи это и не придумывай ошибок.\n"
+        "7) Ответ только в JSON."
+    )
+    if grade_label:
+        system_prompt += f" Контекст: {grade_label}."
+
+    user_prompt = (
+        "Верни РОВНО такой JSON:\n"
+        "{\n"
+        '  "confidence": 0.0,\n'
+        '  "student_final_answer": null,\n'
+        '  "model_final_answer": null,\n'
+        '  "is_final_answer_correct": null,\n'
+        '  "steps_student": [],\n'
+        '  "step_issues": [],\n'
+        '  "gaps": [],\n'
+        '  "need_drills": false,\n'
+        '  "drills": [],\n'
+        '  "summary": "…"\n'
+        "}\n"
+        "Если итог верный и нет ошибок хода — need_drills=false и drills пустой."
+    )
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
+
     payload = {
         "model": OPENAI_MODEL,
         "messages": [
@@ -153,12 +154,9 @@ async def call_openai(img_b64: str, detail: str) -> dict:
             {
                 "role": "user",
                 "content": [
-                    {
+                    {  # СЖАТОЕ изображение в data-URL
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}",
-                            "detail": detail
-                        },
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                     },
                     {"type": "text", "text": user_prompt},
                 ],
@@ -168,30 +166,35 @@ async def call_openai(img_b64: str, detail: str) -> dict:
         "max_tokens": 300,
     }
 
-    start = time.time()
-    print(f"[AI] model={OPENAI_MODEL}, detail={detail}, max_tokens=300, temp=0.0, image_b64_len={len(img_b64)}")
+    start_ts = time.time()
+    print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, sending image_b64_len={len(img_b64)}")
 
     async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post("https://api.openai.com/v1/chat/completions",
-                              headers=headers, json=payload)
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
         if r.status_code != 200:
             print("OpenAI ERROR", r.status_code, r.text)
         r.raise_for_status()
         data = r.json()
 
+    # usage-лог
     try:
-        u = data.get("usage", {})
-        print(f"[AI] usage: prompt={u.get('prompt_tokens')} completion={u.get('completion_tokens')} total={u.get('total_tokens')} time={(time.time()-start):.2f}s")
+        usage = data.get("usage", {})
+        print(f"[AI] usage: prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} total={usage.get('total_tokens')} time={(time.time()-start_ts):.2f}s")
     except Exception:
         pass
 
-    # Парс ответа в JSON
-    raw = data["choices"][0]["message"]["content"]
+    # парсинг JSON-ответа модели
     try:
+        raw = data["choices"][0]["message"]["content"]
         return json.loads(raw)
     except Exception:
         try:
-            return json.loads((raw or "").strip().strip("`").strip())
+            fixed = (raw or "").strip().strip("`").strip()
+            return json.loads(fixed)
         except Exception:
             print("JSON parse failed. Raw:", (raw or "")[:500])
             return {
@@ -207,39 +210,8 @@ async def call_openai(img_b64: str, detail: str) -> dict:
                 "summary": "Не удалось надёжно распознать запись. Переснимите крупнее/резче."
             }
 
-def is_unreadable(result: dict) -> bool:
-    """Критерии, когда считаем, что модель не смогла прочитать."""
-    conf = result.get("confidence")
-    summary = (result.get("summary") or "").lower()
-    no_content = not result.get("steps_student") and result.get("student_final_answer") in (None, "", "null")
-    conf_bad = (isinstance(conf, (int, float)) and conf < 0.4)
-    mentions_blurry = any(word in summary for word in ["неразборч", "плохо видно", "размыто", "не вижу"])
-    return no_content or conf_bad or mentions_blurry
 
-async def analyze_math_image(image_path: Path) -> dict:
-    """
-    Двухступенчатый анализ:
-      Pass A (дешёвый): 640/60, detail=low, с медиан-фильтром.
-      Если нечитабельно -> Pass B (дорогой): 768/72, detail=high, без медиан-фильтра.
-    """
-    # Pass A
-    b64_low, log_low = encode_image_b64(image_path, LOW_MAX_SIDE, LOW_JPEG_Q, apply_median=True)
-    print(f"[IMG/LOW] {log_low}")
-    res_low = await call_openai(b64_low, LOW_DETAIL)
-
-    if not is_unreadable(res_low):
-        res_low["_profile"] = "low"
-        return res_low
-
-    print("[FALLBACK] low-profile unreadable → retry with HIGH profile")
-    # Pass B
-    b64_high, log_high = encode_image_b64(image_path, HIGH_MAX_SIDE, HIGH_JPEG_Q, apply_median=False)
-    print(f"[IMG/HIGH] {log_high}")
-    res_high = await call_openai(b64_high, HIGH_DETAIL)
-    res_high["_profile"] = "high"
-    return res_high
-
-# ---------------- Formatting ---------------------
+# --------------- Formatting -----------------
 def format_report(j: dict) -> str:
     conf  = j.get("confidence")
     s_ans = j.get("student_final_answer")
@@ -251,9 +223,8 @@ def format_report(j: dict) -> str:
     need   = bool(j.get("need_drills"))
     drills = j.get("drills") or []
     summary = j.get("summary") or ""
-    profile = j.get("_profile", "low")
 
-    out = [f"Профиль анализа: {('экономичный' if profile=='low' else 'повышенной точности')}."]
+    out = []
     if ok is True:
         out.append("✅ Итоговый ответ: ВЕРНО.")
     elif ok is False:
@@ -266,10 +237,7 @@ def format_report(j: dict) -> str:
     if m_ans is not None:
         out.append(f"Проверочный ответ: {m_ans}")
     if isinstance(conf, (int, float)):
-        try:
-            out.append(f"Уверенность распознавания: {round(float(conf)*100)}%")
-        except Exception:
-            pass
+        out.append(f"Уверенность распознавания: {round(float(conf)*100)}%")
     out.append("")
 
     if steps:
@@ -305,42 +273,11 @@ def format_report(j: dict) -> str:
     msg = "\n".join(out).strip()
     return msg[:4000] if len(msg) > 4000 else msg
 
-# --------------- Background task ---------------
-async def process_photo(chat_id: int, reply_to: Optional[int], file_id: str):
-    try:
-        file_path = await tg_get_file(file_id)
-        local_path = await tg_download_file(file_path)
 
-        report = await analyze_math_image(local_path)
-        text_report = format_report(report) or \
-            "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
-
-        await tg_send_message(chat_id, text_report)
-    except httpx.HTTPError as e:
-        print("HTTP error during analysis:", e)
-        await tg_send_message(chat_id, "Не удалось связаться с сервисом анализа. Попробуй позже.")
-    except Exception as e:
-        print("Analysis error:", e)
-        print(traceback.format_exc())
-        await tg_send_message(
-            chat_id,
-            "Не удалось проанализировать фото 😕\n"
-            "Сделай снимок ближе и чётче, по одному заданию на фото."
-        )
-
-# --------------------- Routes ---------------------
+# ----------------- Routes -------------------
 @app.get("/")
 def health():
     return {"status": "ok"}
-
-@app.get("/debug")
-def debug():
-    return {
-        "version": APP_VERSION,
-        "model": OPENAI_MODEL,
-        "LOW": {"MAX_SIDE": LOW_MAX_SIDE, "Q": LOW_JPEG_Q, "detail": LOW_DETAIL},
-        "HIGH": {"MAX_SIDE": HIGH_MAX_SIDE, "Q": HIGH_JPEG_Q, "detail": HIGH_DETAIL},
-    }
 
 @app.post("/webhook/telegram")
 async def tg_webhook(request: Request):
@@ -348,44 +285,71 @@ async def tg_webhook(request: Request):
     try:
         update = await request.json()
         message = update.get("message") or update.get("edited_message")
-        if not message:
-            return {"ok": True}
+        if message:
+            chat_id = message["chat"]["id"]
+            message_id = message.get("message_id")
+            text = message.get("text") or ""
+            photos = message.get("photo") or []
 
-        chat_id = message["chat"]["id"]
-        message_id = message.get("message_id")
-        text = message.get("text") or ""
-        photos = message.get("photo") or []
+            # простая защёлка от дубликатов
+            now = time.time()
+            if message_id in SEEN and now - SEEN[message_id] < 60:
+                print(f"[DEDUP] skip message_id {message_id}")
+                return {"ok": True}
+            SEEN[message_id] = now
 
-        now = time.time()
-        if message_id in SEEN and now - SEEN[message_id] < 60:
-            print(f"[DEDUP] skip message_id {message_id}")
-            return {"ok": True}
-        SEEN[message_id] = now
-
-        if text.startswith("/start"):
-            asyncio.create_task(
-                tg_send_message(
-                    chat_id,
+            # /start
+            if text.startswith("/start"):
+                hello = (
                     "Привет! Отправь фото задачи (лучше по одной на фото). "
-                    "Я проверю итог, отмечу реальные недочёты и дам рекомендации.\n\n"
-                    "Лайфхак: снимай крупно и при хорошем свете.",
-                    reply_to=message_id,
+                    "Я проверю итог, отмечу только реальные недочёты и дам рекомендации.\n\n"
+                    "Лайфхак: снимай крупно и при хорошем свете."
                 )
-            )
+                await tg_send_message(chat_id, hello, reply_to=message_id)
+                return {"ok": True}
+
+            # Фото
+            if photos:
+                largest = photos[-1]
+                file_id = largest["file_id"]
+                try:
+                    await tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id)
+
+                    file_path = await tg_get_file(file_id)
+                    local_path = await tg_download_file(file_path)
+
+                    report = await analyze_math_image(local_path)
+                    text_report = format_report(report) or \
+                        "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
+
+                    await tg_send_message(chat_id, text_report)
+                except httpx.HTTPError as e:
+                    print("HTTP error during analysis:", e)
+                    await tg_send_message(chat_id, "Не удалось связаться с сервисом анализа. Попробуй позже.")
+                except Exception as e:
+                    print("Analysis error:", e)
+                    print(traceback.format_exc())
+                    await tg_send_message(
+                        chat_id,
+                        "Не удалось проанализировать фото 😕\n"
+                        "Сделай снимок ближе и чётче, по одному заданию на фото."
+                    )
+                return {"ok": True}
+
+            # Эхо
+            if text:
+                await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
+                return {"ok": True}
+
+            await tg_send_message(chat_id, "Пришли /start или отправь фото.")
             return {"ok": True}
 
-        if photos:
-            largest = photos[-1]
-            file_id = largest["file_id"]
-            asyncio.create_task(tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id))
-            asyncio.create_task(process_photo(chat_id, message_id, file_id))
+        # callback_query — на будущее
+        if update.get("callback_query"):
+            chat_id = update["callback_query"]["message"]["chat"]["id"]
+            await tg_send_message(chat_id, "Кнопка нажата.")
             return {"ok": True}
 
-        if text:
-            asyncio.create_task(tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id))
-            return {"ok": True}
-
-        asyncio.create_task(tg_send_message(chat_id, "Пришли /start или отправь фото."))
         return {"ok": True}
 
     except Exception as e:

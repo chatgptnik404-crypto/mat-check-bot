@@ -1,23 +1,30 @@
 # app.py
 import os
+import io
 import json
+import base64
 import traceback
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
 import httpx
+from PIL import Image
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))            # px (длинная сторона)
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))      # 80–90 норм
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 # ================== APP =====================
 app = FastAPI()
-
+DOWNLOAD_DIR = Path("/tmp/tg_photos")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
@@ -38,56 +45,81 @@ async def tg_send_message(chat_id: int | str, text: str, reply_to: Optional[int]
         print("sendMessage failed:", e)
         print(traceback.format_exc())
 
-async def tg_get_file_path(file_id: str) -> str:
-    """Возвращает file_path на серверах Telegram (без скачивания)."""
+async def tg_get_file(file_id: str) -> str:
     data = await tg_api("getFile", {"file_id": file_id})
     return data["result"]["file_path"]
 
+async def tg_download_file(file_path: str) -> Path:
+    url = f"{FILE_URL}/{file_path}"
+    local = DOWNLOAD_DIR / Path(file_path).name
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(url)
+        if r.status_code != 200:
+            print("FILE GET ERROR", r.status_code, r.text)
+        r.raise_for_status()
+        local.write_bytes(r.content)
+    return local
+
+# --------------- Image helpers --------------
+def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
+    """
+    Открывает картинку, мягко сжимает (длинная сторона <= max_side),
+    сохраняет в JPEG и возвращает base64-строку (ascii).
+    """
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
+    if scale > 1.0:
+        img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 # --------------- OpenAI Vision --------------
-async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> dict:
+async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     """
-    Передаёт прямой URL изображения в OpenAI и получает строгий JSON.
-    Логика: прочитать финальный ответ ученика, решить задачу заново, сравнить,
-    найти только реальные ошибки хода (если есть), решать неуверенность честно.
+    Анализ фото тетради (с предварительным сжатием). Возвращает строгий JSON.
+    Логика:
+      1) считать финальный ответ ученика (если виден),
+      2) решить задачу заново,
+      3) сравнить (целые строго; десятичные — погрешность до 1e-3 или 1%),
+      4) перечислить только реальные недочёты шага,
+      5) не предлагать тренировку, если всё верно и без ошибок.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
+    img_b64 = downscale_to_jpeg_b64(image_path, MAX_SIDE, JPEG_QUALITY)
+
     system_prompt = (
         "Ты — строгий и доброжелательный учитель математики 7–9 классов. "
         "Правила:\n"
-        "1) Аккуратно считай, что написал ученик: выпиши ЕГО финальный ответ (если виден).\n"
-        "2) Независимо реши задачу сам и получи СВОЙ финальный ответ.\n"
-        "3) Сравни: если ответы совпадают (учитывай разумную погрешность для десятичных: 1e-3 или 1%), то итог ВЕРНЫЙ.\n"
-        "4) Отмечай только РЕАЛЬНЫЕ ошибки хода (например, пропуск шага, неверное преобразование). Если хода решения не видно — не выдумывай.\n"
-        "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку и не придумывай ошибки.\n"
-        "6) Если что-то неразборчиво — честно укажи это и не утверждай про ошибки.\n"
-        "7) Пиши строго в JSON указанного формата."
+        "1) Аккуратно прочитай запись ученика и выпиши ЕГО финальный ответ (если виден).\n"
+        "2) Сам реши задачу заново и получи СВОЙ финальный ответ.\n"
+        "3) Сравни: если ответы совпадают (целые — строго, десятичные — с погрешностью 1e-3 или 1%), итог ВЕРНЫЙ.\n"
+        "4) Указывай только РЕАЛЬНЫЕ ошибки/недочёты хода (неразборчиво ≠ ошибка).\n"
+        "5) Если итог верный и ошибок хода НЕТ — не предлагай тренировку.\n"
+        "6) Если видимость плохая — честно укажи это и не придумывай ошибок.\n"
+        "7) Ответ только в JSON."
     )
     if grade_label:
         system_prompt += f" Контекст: {grade_label}."
 
     user_prompt = (
-        "Верни РОВНО такой JSON (без лишнего текста):\n"
+        "Верни РОВНО такой JSON:\n"
         "{\n"
-        '  "confidence": 0.0,                   // 0..1 — уверенность, что запись ученика прочитана верно\n'
-        '  "student_final_answer": null,        // строка/число, финальный ответ ученика, если прочитал; иначе null\n'
-        '  "model_final_answer": null,          // твой рассчитанный ответ (строка/число)\n'
-        '  "is_final_answer_correct": null,     // true/false, а если не удалось прочитать — null\n'
-        '  "steps_student": [],                 // краткая реконструкция шагов ученика, если видны\n'
-        '  "step_issues": [                     // реальные ошибки/недочёты хода, если есть\n'
-        '    {"step": "…", "type": "…", "why": "…"}\n'
-        '  ],\n'
-        '  "gaps": [],                          // вероятные пробелы только если есть ошибки\n'
-        '  "need_drills": false,                // предлагать ли мини-тренировку\n'
-        '  "drills": [],                        // 0–3 задания, только если need_drills=true\n'
-        '  "summary": "…"                       // короткий вывод по делу\n'
+        '  "confidence": 0.0,\n'
+        '  "student_final_answer": null,\n'
+        '  "model_final_answer": null,\n'
+        '  "is_final_answer_correct": null,\n'
+        '  "steps_student": [],\n'
+        '  "step_issues": [],\n'
+        '  "gaps": [],\n'
+        '  "need_drills": false,\n'
+        '  "drills": [],\n'
+        '  "summary": "…"\n"
         "}\n"
-        "Уточнения:\n"
-        "- Итог «верно», если твой ответ совпадает с ученическим (целые — строго, десятичные — погрешность до 1e-3 или 1%).\n"
-        "- Если ответ верный и step_issues пуст — поставь need_drills=false и не пиши drills.\n"
-        "- Если не уверен в чтении цифр — укажи это в summary, оставь is_final_answer_correct = null, не придумывай ошибки."
+        "Если итог верный и нет ошибок хода — need_drills=false и drills пустой."
     )
 
     headers = {
@@ -96,24 +128,30 @@ async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> di
     }
 
     payload = {
-        "model": OPENAI_MODEL,          # gpt-4o-mini или gpt-4o
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {  # СЖАТОЕ изображение в data-URL
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                    },
                     {"type": "text", "text": user_prompt},
                 ],
             },
         ],
         "temperature": 0.0,
-        "max_tokens": 320,              # держим короче и дешевле
+        "max_tokens": 300,
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post("https://api.openai.com/v1/chat/completions",
-                              headers=headers, json=payload)
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
         if r.status_code != 200:
             print("OpenAI ERROR", r.status_code, r.text)
         r.raise_for_status()
@@ -140,6 +178,7 @@ async def analyze_math_image_by_url(image_url: str, grade_label: str = "") -> di
                 "drills": [],
                 "summary": "Не удалось надёжно распознать запись. Переснимите крупнее/резче."
             }
+
 # --------------- Formatting -----------------
 def format_report(j: dict) -> str:
     conf  = j.get("confidence")
@@ -154,8 +193,6 @@ def format_report(j: dict) -> str:
     summary = j.get("summary") or ""
 
     out = []
-
-    # заголовок: верно/неверно/неопределённо
     if ok is True:
         out.append("✅ Итоговый ответ: ВЕРНО.")
     elif ok is False:
@@ -163,25 +200,20 @@ def format_report(j: dict) -> str:
     else:
         out.append("⚠️ Не удалось надёжно прочитать финальный ответ ученика.")
 
-    # финальные ответы
     if s_ans is not None:
         out.append(f"Ответ ученика: {s_ans}")
     if m_ans is not None:
         out.append(f"Проверочный ответ: {m_ans}")
-
-    # уверенность OCR
     if isinstance(conf, (int, float)):
         out.append(f"Уверенность распознавания: {round(float(conf)*100)}%")
     out.append("")
 
-    # шаги ученика (если есть)
     if steps:
         out.append("Шаги ученика (как читаются с фото):")
         for i, s in enumerate(steps, 1):
             out.append(f"{i}) {s}")
         out.append("")
 
-    # реальные недочёты хода
     if issues:
         out.append("Ошибки/недочёты хода решения:")
         for m in issues:
@@ -191,14 +223,12 @@ def format_report(j: dict) -> str:
             out.append(f"• {step}: {mtype}. {why}")
         out.append("")
 
-    # пробелы — только если есть ошибки
     if issues and gaps:
         out.append("Вероятные пробелы:")
         for g in gaps:
             out.append(f"• {g}")
         out.append("")
 
-    # мини-тренировка — только если need_drills == True
     if need and drills:
         out.append("Мини-тренировка:")
         for d in drills:
@@ -220,7 +250,6 @@ def health():
 async def tg_webhook(request: Request):
     try:
         update = await request.json()
-
         message = update.get("message") or update.get("edited_message")
         if message:
             chat_id = message["chat"]["id"]
@@ -232,8 +261,8 @@ async def tg_webhook(request: Request):
             if text.startswith("/start"):
                 hello = (
                     "Привет! Отправь фото задачи (лучше по одной на фото). "
-                    "Я разберу решение, отмечу ошибки и дам мини-тренировку.\n\n"
-                    "Лайфхак: фотографируй крупно и при хорошем свете — так точнее."
+                    "Я проверю итог, отмечу реальные недочёты и дам рекомендации.\n\n"
+                    "Лайфхак: снимай крупно и при хорошем свете."
                 )
                 await tg_send_message(chat_id, hello, reply_to=message_id)
                 return {"ok": True}
@@ -245,32 +274,27 @@ async def tg_webhook(request: Request):
                 try:
                     await tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id)
 
-                    # берём ПРЯМОЙ url с серверов Telegram
-                    file_path = await tg_get_file_path(file_id)
-                    tg_file_url = f"{FILE_URL}/{file_path}"  # публичная ссылка по токену бота
+                    file_path = await tg_get_file(file_id)
+                    local_path = await tg_download_file(file_path)
 
-                    report = await analyze_math_image_by_url(tg_file_url)
+                    report = await analyze_math_image(local_path)
                     text_report = format_report(report) or \
                         "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
 
                     await tg_send_message(chat_id, text_report)
                 except httpx.HTTPError as e:
                     print("HTTP error during analysis:", e)
-                    await tg_send_message(
-                        chat_id,
-                        "Не удалось обратиться к сервису анализа. Попробуй ещё раз чуть позже."
-                    )
+                    await tg_send_message(chat_id, "Не удалось связаться с сервисом анализа. Попробуй позже.")
                 except Exception as e:
                     print("Analysis error:", e)
                     print(traceback.format_exc())
-                    await tg_send_message(
-                        chat_id,
+                    await tg_send_message(chat_id,
                         "Не удалось проанализировать фото 😕\n"
                         "Сделай снимок ближе и чётче, по одному заданию на фото."
                     )
                 return {"ok": True}
 
-            # Эхо — для проверки, что бот жив
+            # Эхо для текстов (чтобы видеть, что бот жив)
             if text:
                 await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
                 return {"ok": True}
@@ -278,7 +302,7 @@ async def tg_webhook(request: Request):
             await tg_send_message(chat_id, "Пришли /start или отправь фото.")
             return {"ok": True}
 
-        # под кнопки на будущее
+        # callback_query — на будущее
         if update.get("callback_query"):
             chat_id = update["callback_query"]["message"]["chat"]["id"]
             await tg_send_message(chat_id, "Кнопка нажата.")

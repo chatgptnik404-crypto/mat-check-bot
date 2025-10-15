@@ -13,29 +13,30 @@ from fastapi import FastAPI, Request
 import httpx
 from PIL import Image, ImageOps, ImageFilter
 
-# =============== CONFIG (hard-coded) ===============
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
 
-# ЖЁСТКО фиксируем параметры сжатия (ENV НЕ читаем)
-MAX_SIDE = 640          # px (длинная сторона)
-JPEG_QUALITY = 60       # 58–65 ок
+# Жёстко зашьём параметры сжатия
+MAX_SIDE = 640          # px длинная сторона
+JPEG_QUALITY = 60       # качество JPEG
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-print(f"[CFG] model={OPENAI_MODEL} MAX_SIDE={MAX_SIDE} JPEG_QUALITY={JPEG_QUALITY}")
+APP_VERSION = "build-2025-10-16-02"
+print(f"[BOOT] starting {APP_VERSION} | model={OPENAI_MODEL} | MAX_SIDE={MAX_SIDE} | Q={JPEG_QUALITY}")
 
-# =============== APP ===============================
+# ================ APP ======================
 app = FastAPI()
 DOWNLOAD_DIR = Path("/tmp/tg_photos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# защита от повторной обработки одного message_id (на 60 секунд)
+# простая защита от дублей
 SEEN: dict[int, float] = {}
 
-# ---------------- Telegram helpers ----------------
+# ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.post(f"{API_URL}/{method}", json=payload)
@@ -69,7 +70,8 @@ async def tg_download_file(file_path: str) -> Path:
         local.write_bytes(r.content)
     return local
 
-# ---------------- Image helpers -------------------
+
+# --------------- Image helpers --------------
 def _trim_whitespace(img_l: Image.Image, thresh: int = 245) -> Image.Image:
     """Обрезаем почти белые поля по краям."""
     bw = img_l.point(lambda p: 255 if p > thresh else 0, mode="L")
@@ -80,14 +82,14 @@ def _trim_whitespace(img_l: Image.Image, thresh: int = 245) -> Image.Image:
 
 def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
     """
-    Сильно сжимаем: grayscale, trim полей, median-фильтр против шума клеток,
-    resize до max_side, автоконтраст, JPEG(quality), base64. Логируем размеры.
+    Сильно сжимаем: grayscale, trim полей, median-фильтр для клеток,
+    resize до max_side, автоконтраст, JPEG -> base64.
     """
-    img = Image.open(path).convert("L")  # grayscale
+    img = Image.open(path).convert("L")
     w0, h0 = img.size
 
     img = _trim_whitespace(img, thresh=245)
-    img = img.filter(ImageFilter.MedianFilter(size=3))  # сгладить клетки/шум
+    img = img.filter(ImageFilter.MedianFilter(size=3))
 
     w1, h1 = img.size
     scale = max(w1, h1) / max_side if max(w1, h1) > max_side else 1.0
@@ -101,48 +103,50 @@ def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = J
     jpeg_bytes = buf.getvalue()
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
 
-    print(f"[IMG] original {w0}x{h0} -> trimmed {w1}x{h1} -> resized {img.size[0]}x{img.size[1]}, "
-          f"jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}, MAX_SIDE={max_side}, Q={quality}")
+    print(
+        f"[IMG] original {w0}x{h0} -> trimmed {w1}x{h1} -> resized {img.size[0]}x{img.size[1]}, "
+        f"jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}, MAX_SIDE={max_side}, Q={quality}"
+    )
     return b64
 
-# ---------------- OpenAI Vision -------------------
+
+# --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
-    """Анализ фото (сжатие → vision). Возвращает строгий JSON по правилам «не придумывать»."""
+    """Анализ фото (сжатие -> vision). Строгий JSON, без выдумывания ошибок."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
     img_b64 = downscale_to_jpeg_b64(image_path, MAX_SIDE, JPEG_QUALITY)
 
-    system_prompt = (
-        "Ты — строгий и доброжелательный учитель математики 7–9 классов.\n"
-        "1) Считай финальный ответ ученика (если виден).\n"
-        "2) Реши задачу сам и получи свой финальный ответ.\n"
-        "3) Сравни: целые — строго, десятичные — с погрешностью 1e-3 или 1%.\n"
-        "4) Указывай ТОЛЬКО реальные ошибки хода (неразборчиво ≠ ошибка).\n"
-        "5) Если итог верный и ошибок хода нет — не предлагай тренировку.\n"
-        "6) Если видимость плохая — честно указать и не придумывать ошибки.\n"
-        "Ответ строго в JSON."
-    )
+    system_prompt = """Ты — строгий и доброжелательный учитель математики 7–9 классов.
+1) Считай финальный ответ ученика (если виден).
+2) Реши задачу сам и получи свой финальный ответ.
+3) Сравни: целые — строго; десятичные — с погрешностью 1e-3 или 1%.
+4) Указывай ТОЛЬКО реальные ошибки хода (неразборчиво ≠ ошибка).
+5) Если итог верный и ошибок хода нет — не предлагай тренировку.
+6) Если видимость плохая — честно укажи это и не придумывай ошибки.
+Ответ строго в JSON.
+"""
     if grade_label:
-        system_prompt += f"\nКонтекст: {grade_label}"
+        system_prompt += f"\nКонтекст: {grade_label}\n"
 
-    user_prompt = (
-        "Верни РОВНО такой JSON:\n"
-        "{\n"
-        '  "confidence": 0.0,\n'
-        '  "student_final_answer": null,\n'
-        '  "model_final_answer": null,\n'
-        '  "is_final_answer_correct": null,\n'
-        '  "steps_student": [],\n'
-        '  "step_issues": [],\n'
-        '  "gaps": [],\n'
-        '  "need_drills": false,\n'
-        '  "drills": [],\n'
-        '  "summary": "…"\n"
-        "}\n"
-        "Если итог верный и нет ошибок хода — need_drills=false, drills пуст.\n"
-        "Если запись неразборчива — укажи это в summary и не придумывай ошибки."
-    )
+    user_prompt = """Верни РОВНО такой JSON:
+{
+  "confidence": 0.0,
+  "student_final_answer": null,
+  "model_final_answer": null,
+  "is_final_answer_correct": null,
+  "steps_student": [],
+  "step_issues": [],
+  "gaps": [],
+  "need_drills": false,
+  "drills": [],
+  "summary": "…"
+}
+Правила вывода:
+- Если итог верный и нет ошибок хода — need_drills=false и drills пуст.
+- Если запись неразборчива — укажи это в summary и не придумывай ошибки.
+"""
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -160,7 +164,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/jpeg;base64,{img_b64}",
-                            "detail": "low"  # экономим vision-токены
+                            "detail": "low"
                         },
                     },
                     {"type": "text", "text": user_prompt},
@@ -191,13 +195,14 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     except Exception:
         pass
 
+    # Парсим JSON из ответа
     try:
         raw = data["choices"][0]["message"]["content"]
         return json.loads(raw)
     except Exception:
         try:
-            fixed = (raw or "").strip().strip("`").strip()
-            return json.loads(fixed)
+            raw = (raw or "").strip().strip("`").strip()
+            return json.loads(raw)
         except Exception:
             print("JSON parse failed. Raw:", (raw or "")[:500])
             return {
@@ -213,7 +218,8 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
                 "summary": "Не удалось надёжно распознать запись. Переснимите крупнее/резче."
             }
 
-# ---------------- Formatting ---------------------
+
+# --------------- Formatting -----------------
 def format_report(j: dict) -> str:
     conf  = j.get("confidence")
     s_ans = j.get("student_final_answer")
@@ -275,15 +281,15 @@ def format_report(j: dict) -> str:
     msg = "\n".join(out).strip()
     return msg[:4000] if len(msg) > 4000 else msg
 
-# -------- Background processing for photo --------
+
+# --------- Background task for photo --------
 async def process_photo(chat_id: int, reply_to: Optional[int], file_id: str):
     try:
         file_path = await tg_get_file(file_id)
         local_path = await tg_download_file(file_path)
 
         report = await analyze_math_image(local_path)
-        text_report = format_report(report) or \
-            "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
+        text_report = format_report(report) or "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
 
         await tg_send_message(chat_id, text_report)
     except httpx.HTTPError as e:
@@ -294,19 +300,18 @@ async def process_photo(chat_id: int, reply_to: Optional[int], file_id: str):
         print(traceback.format_exc())
         await tg_send_message(
             chat_id,
-            "Не удалось проанализировать фото 😕\n"
-            "Сделай снимок ближе и чётче, по одному заданию на фото."
+            "Не удалось проанализировать фото 😕\nСделай снимок ближе и чётче, по одному заданию на фото."
         )
 
-# --------------------- Routes ---------------------
+
+# -------------------- Routes --------------------
 @app.get("/")
 def health():
     return {"status": "ok"}
 
 @app.get("/debug")
 def debug():
-    # Быстрый способ убедиться, что подхватились нужные константы
-    return {"model": OPENAI_MODEL, "MAX_SIDE": MAX_SIDE, "JPEG_QUALITY": JPEG_QUALITY}
+    return {"version": APP_VERSION, "model": OPENAI_MODEL, "MAX_SIDE": MAX_SIDE, "JPEG_QUALITY": JPEG_QUALITY}
 
 @app.post("/webhook/telegram")
 async def tg_webhook(request: Request):
@@ -322,7 +327,7 @@ async def tg_webhook(request: Request):
         text = message.get("text") or ""
         photos = message.get("photo") or []
 
-        # защита от дублей (60 сек)
+        # дедупликация (60 сек)
         now = time.time()
         if message_id in SEEN and now - SEEN[message_id] < 60:
             print(f"[DEDUP] skip message_id {message_id}")
@@ -333,9 +338,7 @@ async def tg_webhook(request: Request):
             asyncio.create_task(
                 tg_send_message(
                     chat_id,
-                    "Привет! Отправь фото задачи (лучше по одной на фото). "
-                    "Я проверю итог, отмечу реальные недочёты и дам рекомендации.\n\n"
-                    "Лайфхак: снимай крупно и при хорошем свете.",
+                    "Привет! Отправь фото задачи (лучше по одной на фото). Я проверю итог, отмечу реальные недочёты и дам рекомендации.\n\nЛайфхак: снимай крупно и при хорошем свете.",
                     reply_to=message_id,
                 )
             )

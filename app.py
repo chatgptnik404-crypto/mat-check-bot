@@ -17,8 +17,10 @@ from PIL import Image
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))            # px длинная сторона
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))      # 75–85 ок
+
+# Агрессивнее ужимаем изображение, чтобы снизить prompt_tokens
+MAX_SIDE = int(os.getenv("MAX_SIDE", "768"))           # px (длинная сторона)
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))    # 65–75 ок
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -70,17 +72,17 @@ async def tg_download_file(file_path: str) -> Path:
 # --------------- Image helpers --------------
 def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
     """
-    Сжимаем: переводим в градации серого, уменьшаем до max_side,
-    слегка поднимаем контраст, сохраняем JPEG и отдаём base64.
+    Сжимаем: grayscale, уменьшаем до max_side, чуть повышаем контраст,
+    сохраняем JPEG и отдаем base64. Пишем логи размера.
     """
-    img = Image.open(path).convert("L")  # grayscale экономит токены
+    img = Image.open(path).convert("L")  # grayscale = меньше токенов
     w0, h0 = img.size
     scale = max(w0, h0) / max_side if max(w0, h0) > max_side else 1.0
     if scale > 1.0:
-        img = img.resize((int(w0/scale), int(h0/scale)), Image.LANCZOS)
+        img = img.resize((int(w0 / scale), int(h0 / scale)), Image.LANCZOS)
 
-    # лёгкий контраст — помогает OCR на меньшем размере
-    img = img.point(lambda p: min(255, int(p * 1.15)))
+    # Лёгкая подкачка контраста/яркости, меньше шума клеток
+    img = img.point(lambda p: min(255, int(p * 1.05)))
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
@@ -95,12 +97,12 @@ def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = J
 # --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     """
-    Анализ фото тетради (со сжатием в base64). Возвращает строгий JSON.
+    Анализ фото (со сжатием в base64). Возвращает строгий JSON.
     Логика:
-      1) прочитать финальный ответ ученика (если виден),
+      1) прочитать финальный ответ ученика,
       2) решить заново,
       3) сравнить (целые строго; десятичные — 1e-3 или 1%),
-      4) перечислить только реальные недочёты шага,
+      4) перечислить ТОЛЬКО реальные недочёты шага,
       5) не давать тренировку, если всё верно и без ошибок.
     """
     if not OPENAI_API_KEY:
@@ -310,7 +312,7 @@ async def tg_webhook(request: Request):
             text = message.get("text") or ""
             photos = message.get("photo") or []
 
-            # защита от дублей (на 60 сек)
+            # защита от дублей (60 сек)
             now = time.time()
             if message_id in SEEN and now - SEEN[message_id] < 60:
                 print(f"[DEDUP] skip message_id {message_id}")
@@ -328,16 +330,15 @@ async def tg_webhook(request: Request):
                         reply_to=message_id,
                     )
                 )
-                return {"ok": True}  # мгновенный ответ Telegram
+                return {"ok": True}  # мгновенно отвечаем Telegram
 
             # Фото
             if photos:
                 largest = photos[-1]
                 file_id = largest["file_id"]
-                # сразу отвечаем пользователю, а тяжёлую часть делаем в фоне
                 asyncio.create_task(tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id))
                 asyncio.create_task(process_photo(chat_id, message_id, file_id))
-                return {"ok": True}  # мгновенный ответ Telegram
+                return {"ok": True}  # мгновенный 200 OK
 
             # Эхо
             if text:

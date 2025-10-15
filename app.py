@@ -4,6 +4,7 @@ import io
 import json
 import base64
 import time
+import asyncio
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -16,7 +17,7 @@ from PIL import Image
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))            # px длинная сторона (экономно)
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))            # px длинная сторона
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))      # 75–85 ок
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -29,6 +30,7 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # простая защёлка от дублей одного апдейта
 SEEN: dict[int, float] = {}  # message_id -> ts
+
 
 # ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
@@ -64,11 +66,12 @@ async def tg_download_file(file_path: str) -> Path:
         local.write_bytes(r.content)
     return local
 
+
 # --------------- Image helpers --------------
 def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
     """
     Сжимаем: переводим в градации серого, уменьшаем до max_side,
-    слегка поднимаем контраст, сохраняем JPEG и отдаем base64.
+    слегка поднимаем контраст, сохраняем JPEG и отдаём base64.
     """
     img = Image.open(path).convert("L")  # grayscale экономит токены
     w0, h0 = img.size
@@ -87,6 +90,7 @@ def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = J
     print(f"[IMG] resized {w0}x{h0} -> {img.size[0]}x{img.size[1]}, "
           f"jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}")
     return b64
+
 
 # --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
@@ -200,6 +204,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
                 "summary": "Не удалось надёжно распознать запись. Переснимите крупнее/резче."
             }
 
+
 # --------------- Formatting -----------------
 def format_report(j: dict) -> str:
     conf  = j.get("confidence")
@@ -262,6 +267,32 @@ def format_report(j: dict) -> str:
     msg = "\n".join(out).strip()
     return msg[:4000] if len(msg) > 4000 else msg
 
+
+# --------- Background task for photo --------
+async def process_photo(chat_id: int, reply_to: Optional[int], file_id: str):
+    """Скачиваем, сжимаем, анализируем и шлём отчёт — уже не блокируя вебхук."""
+    try:
+        file_path = await tg_get_file(file_id)
+        local_path = await tg_download_file(file_path)
+
+        report = await analyze_math_image(local_path)
+        text_report = format_report(report) or \
+            "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
+
+        await tg_send_message(chat_id, text_report)
+    except httpx.HTTPError as e:
+        print("HTTP error during analysis:", e)
+        await tg_send_message(chat_id, "Не удалось связаться с сервисом анализа. Попробуй позже.")
+    except Exception as e:
+        print("Analysis error:", e)
+        print(traceback.format_exc())
+        await tg_send_message(
+            chat_id,
+            "Не удалось проанализировать фото 😕\n"
+            "Сделай снимок ближе и чётче, по одному заданию на фото."
+        )
+
+
 # ----------------- Routes -------------------
 @app.get("/")
 def health():
@@ -279,7 +310,7 @@ async def tg_webhook(request: Request):
             text = message.get("text") or ""
             photos = message.get("photo") or []
 
-            # защитимся от дублей
+            # защита от дублей (на 60 сек)
             now = time.time()
             if message_id in SEEN and now - SEEN[message_id] < 60:
                 print(f"[DEDUP] skip message_id {message_id}")
@@ -288,54 +319,32 @@ async def tg_webhook(request: Request):
 
             # /start
             if text.startswith("/start"):
-                hello = (
-                    "Привет! Отправь фото задачи (лучше по одной на фото). "
-                    "Я проверю итог, отмечу реальные недочёты и дам рекомендации.\n\n"
-                    "Лайфхак: снимай крупно и при хорошем свете."
+                asyncio.create_task(
+                    tg_send_message(
+                        chat_id,
+                        "Привет! Отправь фото задачи (лучше по одной на фото). "
+                        "Я проверю итог, отмечу реальные недочёты и дам рекомендации.\n\n"
+                        "Лайфхак: снимай крупно и при хорошем свете.",
+                        reply_to=message_id,
+                    )
                 )
-                await tg_send_message(chat_id, hello, reply_to=message_id)
-                return {"ok": True}
+                return {"ok": True}  # мгновенный ответ Telegram
 
             # Фото
             if photos:
                 largest = photos[-1]
                 file_id = largest["file_id"]
-                try:
-                    await tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id)
+                # сразу отвечаем пользователю, а тяжёлую часть делаем в фоне
+                asyncio.create_task(tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id))
+                asyncio.create_task(process_photo(chat_id, message_id, file_id))
+                return {"ok": True}  # мгновенный ответ Telegram
 
-                    file_path = await tg_get_file(file_id)
-                    local_path = await tg_download_file(file_path)
-
-                    report = await analyze_math_image(local_path)
-                    text_report = format_report(report) or \
-                        "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
-
-                    await tg_send_message(chat_id, text_report)
-                except httpx.HTTPError as e:
-                    print("HTTP error during analysis:", e)
-                    await tg_send_message(chat_id, "Не удалось связаться с сервисом анализа. Попробуй позже.")
-                except Exception as e:
-                    print("Analysis error:", e)
-                    print(traceback.format_exc())
-                    await tg_send_message(
-                        chat_id,
-                        "Не удалось проанализировать фото 😕\n"
-                        "Сделай снимок ближе и чётче, по одному заданию на фото."
-                    )
-                return {"ok": True}
-
-            # Эхо для текстов
+            # Эхо
             if text:
-                await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
+                asyncio.create_task(tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id))
                 return {"ok": True}
 
-            await tg_send_message(chat_id, "Пришли /start или отправь фото.")
-            return {"ok": True}
-
-        # callback_query — на будущее
-        if update.get("callback_query"):
-            chat_id = update["callback_query"]["message"]["chat"]["id"]
-            await tg_send_message(chat_id, "Кнопка нажата.")
+            asyncio.create_task(tg_send_message(chat_id, "Пришли /start или отправь фото."))
             return {"ok": True}
 
         return {"ok": True}

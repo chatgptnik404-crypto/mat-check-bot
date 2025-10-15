@@ -1,3 +1,4 @@
+# app.py
 import os
 import io
 import json
@@ -10,22 +11,22 @@ from fastapi import FastAPI, Request
 import httpx
 from PIL import Image
 
-# ==== CONFIG ====
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # можно сменить на gpt-4o
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))  # макс. длина стороны для сжатия
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # "gpt-4o-mini" или "gpt-4o"
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))  # длинная сторона изображения (px)
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-# ==== APP ====
+# ================== APP =====================
 app = FastAPI()
 DOWNLOAD_DIR = Path("/tmp/tg_photos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------- Telegram helpers ----------
+# ------------- Telegram helpers -------------
 async def tg_api(method: str, payload: dict):
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.post(f"{API_URL}/{method}", json=payload)
@@ -60,7 +61,7 @@ async def tg_download_file(file_path: str) -> Path:
     return local
 
 
-# ---------- Image helpers ----------
+# --------------- Image helpers --------------
 def load_and_downscale(path: Path, max_side: int = MAX_SIDE) -> bytes:
     """
     Открывает картинку, мягко сжимает (длинная сторона <= max_side),
@@ -79,7 +80,7 @@ def b64_jpeg(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode("ascii")
 
 
-# ---------- OpenAI Vision ----------
+# --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     """
     Отправляет картинку в мультимодальную модель OpenAI и получает структурированный JSON.
@@ -88,11 +89,11 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
-    # готовим картинку
+    # подготовка картинки
     img_bytes = load_and_downscale(image_path, MAX_SIDE)
     img_b64 = b64_jpeg(img_bytes)
 
-    # промпт (уточняем краткость ответа и формат JSON)
+    # промпты
     system_prompt = (
         "Ты — учитель математики 7–9 классов. Анализируй фото тетради: "
         "коротко распиши шаги решения, найди типовые ошибки, сформулируй вероятные пробелы "
@@ -105,7 +106,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         "Верни строго такой JSON без лишнего текста:\n"
         "{\n"
         '  "steps": ["шаг 1", "шаг 2", "..."],\n'
-        '  "mistakes": [{"where":"...", "type":"...", "why":"..." }],\n'
+        '  "mistakes": [{"where":"...", "type":"...", "why":"..."}],\n'
         '  "gaps": ["..."],\n'
         '  "drills": ["задача 1", "задача 2", "задача 3"],\n'
         '  "summary": "1–2 предложения: что подтянуть"\n'
@@ -113,16 +114,13 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         "Если что-то не видно — укажи это в summary и всё равно верни JSON."
     )
 
-    # вызов OpenAI Responses API
-    # используем чистый httpx (SDK 1.x тоже ок, но так надёжнее в небольшом файле)
-    # --- ВЫЗОВ OpenAI Chat API ---
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
     payload = {
-        "model": OPENAI_MODEL,  # например, gpt-4o-mini или gpt-4o
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -151,50 +149,17 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         r.raise_for_status()
         data = r.json()
 
-    # --- Извлекаем текст ---
+    # извлекаем текст и парсим JSON
     try:
         raw = data["choices"][0]["message"]["content"]
         parsed = json.loads(raw)
         return parsed
     except Exception:
         try:
-            fixed = raw.strip().strip("`").strip()
+            fixed = (raw or "").strip().strip("`").strip()
             return json.loads(fixed)
         except Exception:
-            print("JSON parse failed. Raw:", raw[:500])
-            return {
-                "steps": [],
-                "mistakes": [],
-                "gaps": [],
-                "drills": [],
-                "summary": "Не удалось распарсить ответ модели. Попробуйте переснять фото."
-            }
-
-    # держим защитный парсинг на случай изменений
-    def extract_text(res: dict) -> str:
-        # попытка 1: новый формат
-        try:
-            return res["output"][0]["content"][0]["text"]
-        except Exception:
-            pass
-        # попытка 2: candidates
-        try:
-            return res["choices"][0]["message"]["content"]
-        except Exception:
-            pass
-        return "{}"
-
-    raw = extract_text(data)
-    try:
-        parsed = json.loads(raw)
-        return parsed
-    except Exception:
-        # если пришёл нестрогий JSON — пытаемся поправить
-        try:
-            fixed = raw.strip().strip("`").strip()
-            return json.loads(fixed)
-        except Exception:
-            print("JSON parse failed. Raw:", raw[:500])
+            print("JSON parse failed. Raw:", (raw or "")[:500])
             return {
                 "steps": [],
                 "mistakes": [],
@@ -204,7 +169,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
             }
 
 
-# ---------- Format helpers ----------
+# --------------- Formatting -----------------
 def format_report(j: dict) -> str:
     steps = j.get("steps") or []
     mistakes = j.get("mistakes") or []
@@ -247,11 +212,10 @@ def format_report(j: dict) -> str:
         lines.append(f"Итог: {summary}")
 
     msg = "\n".join(lines).strip()
-    # Telegram ограничение ~4096 символов
     return msg[:4000] if len(msg) > 4000 else msg
 
 
-# ---------- Routes ----------
+# ----------------- Routes -------------------
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -260,7 +224,6 @@ def health():
 async def tg_webhook(request: Request):
     try:
         update = await request.json()
-        # print("== Incoming ==", update)
 
         message = update.get("message") or update.get("edited_message")
         if message:
@@ -268,7 +231,7 @@ async def tg_webhook(request: Request):
             message_id = message.get("message_id")
             text = message.get("text") or ""
             photos = message.get("photo") or []
-            grade_label = ""  # на будущее: можно хранить выбор темы/класса
+            grade_label = ""  # на будущее: выбор темы/класса
 
             # /start
             if text.startswith("/start"):
@@ -284,26 +247,33 @@ async def tg_webhook(request: Request):
                 largest = photos[-1]
                 file_id = largest["file_id"]
                 try:
-                    # подтверждение сразу (UX)
                     await tg_send_message(chat_id, "Фото получено ✅ Анализирую…", reply_to=message_id)
 
                     file_path = await tg_get_file(file_id)
                     local_path = await tg_download_file(file_path)
 
                     report = await analyze_math_image(local_path, grade_label=grade_label)
-                    text_report = format_report(report)
-
-                    if not text_report:
-                        text_report = "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
+                    text_report = format_report(report) or \
+                        "Не получилось сформировать отчёт. Попробуйте переснять фото крупнее/резче."
 
                     await tg_send_message(chat_id, text_report)
+                except httpx.HTTPError as e:
+                    print("HTTP error during analysis:", e)
+                    await tg_send_message(
+                        chat_id,
+                        "Не удалось обратиться к сервису анализа. Попробуй ещё раз чуть позже."
+                    )
                 except Exception as e:
-                    await tg_send_message(chat_id, f"Ошибка анализа: {e}")
                     print("Analysis error:", e)
                     print(traceback.format_exc())
+                    await tg_send_message(
+                        chat_id,
+                        "Не удалось проанализировать фото 😕\n"
+                        "Сделай снимок ближе и чётче, по одному заданию на фото."
+                    )
                 return {"ok": True}
 
-            # любой другой текст — эхо
+            # любой другой текст — эхо, чтобы было видно, что бот жив
             if text:
                 await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
                 return {"ok": True}
@@ -311,7 +281,7 @@ async def tg_webhook(request: Request):
             await tg_send_message(chat_id, "Пришли /start или отправь фото.")
             return {"ok": True}
 
-        # callback_query (на будущее для кнопок)
+        # callback_query (резерв под кнопки)
         if update.get("callback_query"):
             chat_id = update["callback_query"]["message"]["chat"]["id"]
             await tg_send_message(chat_id, "Кнопка нажата.")
@@ -322,4 +292,5 @@ async def tg_webhook(request: Request):
     except Exception as e:
         print("Webhook handler error:", e)
         print(traceback.format_exc())
+        # Всегда 200, чтобы Telegram не засыпал ретраями
         return {"ok": True}

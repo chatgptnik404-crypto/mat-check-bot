@@ -14,8 +14,8 @@ from PIL import Image
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # "gpt-4o-mini" или "gpt-4o"
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))  # длинная сторона изображения (px)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))  # px для длинной стороны
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -63,10 +63,7 @@ async def tg_download_file(file_path: str) -> Path:
 
 # --------------- Image helpers --------------
 def load_and_downscale(path: Path, max_side: int = MAX_SIDE) -> bytes:
-    """
-    Открывает картинку, мягко сжимает (длинная сторона <= max_side),
-    сохраняет в JPEG и возвращает байты.
-    """
+    """Открывает картинку, сжимает (max длинная сторона), JPEG -> bytes."""
     img = Image.open(path).convert("RGB")
     w, h = img.size
     scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
@@ -82,18 +79,13 @@ def b64_jpeg(image_bytes: bytes) -> str:
 
 # --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
-    """
-    Отправляет картинку в мультимодальную модель OpenAI и получает структурированный JSON.
-    Возвращает dict.
-    """
+    """Отправляет картинку в OpenAI (vision) и возвращает структурированный JSON."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
-    # подготовка картинки
     img_bytes = load_and_downscale(image_path, MAX_SIDE)
     img_b64 = b64_jpeg(img_bytes)
 
-    # промпты
     system_prompt = (
         "Ты — учитель математики 7–9 классов. Анализируй фото тетради: "
         "коротко распиши шаги решения, найди типовые ошибки, сформулируй вероятные пробелы "
@@ -119,6 +111,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         "Content-Type": "application/json",
     }
 
+    # ВАЖНО: image_url должен быть объектом {"url": "..."} — иначе 400 invalid_type
     payload = {
         "model": OPENAI_MODEL,
         "messages": [
@@ -128,7 +121,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": f"data:image/jpeg;base64,{img_b64}",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                     },
                     {"type": "text", "text": user_prompt},
                 ],
@@ -149,7 +142,7 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         r.raise_for_status()
         data = r.json()
 
-    # извлекаем текст и парсим JSON
+    # Достаём текст и парсим JSON
     try:
         raw = data["choices"][0]["message"]["content"]
         parsed = json.loads(raw)
@@ -231,7 +224,7 @@ async def tg_webhook(request: Request):
             message_id = message.get("message_id")
             text = message.get("text") or ""
             photos = message.get("photo") or []
-            grade_label = ""  # на будущее: выбор темы/класса
+            grade_label = ""
 
             # /start
             if text.startswith("/start"):
@@ -273,7 +266,7 @@ async def tg_webhook(request: Request):
                     )
                 return {"ok": True}
 
-            # любой другой текст — эхо, чтобы было видно, что бот жив
+            # Эхо на любой текст (для проверки)
             if text:
                 await tg_send_message(chat_id, f"Я получил: {text}", reply_to=message_id)
                 return {"ok": True}
@@ -281,7 +274,7 @@ async def tg_webhook(request: Request):
             await tg_send_message(chat_id, "Пришли /start или отправь фото.")
             return {"ok": True}
 
-        # callback_query (резерв под кнопки)
+        # Для callback-кнопок (на будущее)
         if update.get("callback_query"):
             chat_id = update["callback_query"]["message"]["chat"]["id"]
             await tg_send_message(chat_id, "Кнопка нажата.")
@@ -292,5 +285,4 @@ async def tg_webhook(request: Request):
     except Exception as e:
         print("Webhook handler error:", e)
         print(traceback.format_exc())
-        # Всегда 200, чтобы Telegram не засыпал ретраями
         return {"ok": True}

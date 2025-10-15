@@ -4,6 +4,7 @@ import io
 import json
 import base64
 import traceback
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -61,19 +62,27 @@ async def tg_download_file(file_path: str) -> Path:
     return local
 
 # --------------- Image helpers --------------
+
 def downscale_to_jpeg_b64(path: Path, max_side: int = MAX_SIDE, quality: int = JPEG_QUALITY) -> str:
-    """
-    Открывает картинку, мягко сжимает (длинная сторона <= max_side),
-    сохраняет в JPEG и возвращает base64-строку (ascii).
-    """
-    img = Image.open(path).convert("RGB")
+    img = Image.open(path).convert("L")  # grayscale: экономнее токены
     w, h = img.size
     scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
     if scale > 1.0:
         img = img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+
+    # лёгкое повышение контраста: помогает OCR на малом размере
+    img = img.point(lambda p: min(255, int(p * 1.15)))
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    jpeg_bytes = buf.getvalue()
+    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+
+    # ЛОГИ
+    print(f"[IMG] resized {w}x{h} -> {img.size[0]}x{img.size[1]}, jpeg={len(jpeg_bytes)/1024:.1f}KB, b64_len={len(b64)}")
+
+    return b64
+
 
 # --------------- OpenAI Vision --------------
 async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
@@ -90,6 +99,8 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
     img_b64 = downscale_to_jpeg_b64(image_path, MAX_SIDE, JPEG_QUALITY)
+    start_ts = time.time()
+print(f"[AI] model={OPENAI_MODEL}, max_tokens=300, temp=0.0, sending image_b64_len={len(img_b64)}")
 
     system_prompt = (
         "Ты — строгий и доброжелательный учитель математики 7–9 классов. "
@@ -156,6 +167,12 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
             print("OpenAI ERROR", r.status_code, r.text)
         r.raise_for_status()
         data = r.json()
+    try:
+        usage = data.get("usage", {})
+        print(f"[AI] usage: prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} total={usage.get('total_tokens')} time={(time.time()-start_ts):.2f}s")
+    except Exception:
+        pass
+
 
     try:
         raw = data["choices"][0]["message"]["content"]
@@ -248,6 +265,18 @@ def health():
 
 @app.post("/webhook/telegram")
 async def tg_webhook(request: Request):
+    global SEEN
+    try:
+        update = await request.json()
+        message = update.get("message") or update.get("edited_message")
+        if message:
+            mid = message.get("message_id")
+            now = time.time()
+            # если в последние 60 секунд уже обрабатывали этот message_id — выходим
+            if mid in SEEN and now - SEEN[mid] < 60:
+                print(f"[DEDUP] skip message_id {mid}")
+                return {"ok": True}
+            SEEN[mid] = now
     try:
         update = await request.json()
         message = update.get("message") or update.get("edited_message")

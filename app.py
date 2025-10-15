@@ -18,12 +18,14 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # или "gpt-4o"
 
-# Агрессивнее ужимаем изображение, чтобы снизить prompt_tokens
-MAX_SIDE = int(os.getenv("MAX_SIDE", "768"))           # px (длинная сторона)
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))    # 65–75 ок
+# ЖЁСТКО: не читаем из ENV
+MAX_SIDE = 640          # ↓ снизили
+JPEG_QUALITY = 60       # ↓ снизили
 
 API_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+
+print(f"[CFG] model={OPENAI_MODEL} MAX_SIDE={MAX_SIDE} JPEG_QUALITY={JPEG_QUALITY}")
 
 # ================== APP =====================
 app = FastAPI()
@@ -299,6 +301,11 @@ async def process_photo(chat_id: int, reply_to: Optional[int], file_id: str):
 @app.get("/")
 def health():
     return {"status": "ok"}
+    
+@app.get("/debug")
+def debug():
+    return {"model": OPENAI_MODEL, "MAX_SIDE": MAX_SIDE, "JPEG_QUALITY": JPEG_QUALITY}
+
 
 @app.post("/webhook/telegram")
 async def tg_webhook(request: Request):

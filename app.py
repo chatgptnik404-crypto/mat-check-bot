@@ -115,48 +115,61 @@ async def analyze_math_image(image_path: Path, grade_label: str = "") -> dict:
 
     # вызов OpenAI Responses API
     # используем чистый httpx (SDK 1.x тоже ок, но так надёжнее в небольшом файле)
+    # --- ВЫЗОВ OpenAI Chat API ---
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
+
     payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_prompt}],
-            },
+        "model": OPENAI_MODEL,  # например, gpt-4o-mini или gpt-4o
+        "messages": [
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "input_image",
-                        "image": {
-                            "data": img_b64,
-                            "mime_type": "image/jpeg",
-                        },
+                        "type": "image_url",
+                        "image_url": f"data:image/jpeg;base64,{img_b64}",
                     },
                     {"type": "text", "text": user_prompt},
                 ],
             },
         ],
-        "max_output_tokens": 600,
         "temperature": 0.2,
-        "response_format": { "type": "json_object" }
+        "max_tokens": 600,
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(
-            "https://api.openai.com/v1/responses",
+            "https://api.openai.com/v1/chat/completions",
             headers=headers,
-            json=payload
+            json=payload,
         )
         if r.status_code != 200:
             print("OpenAI ERROR", r.status_code, r.text)
         r.raise_for_status()
         data = r.json()
 
-    # В Responses API текст лежит в data["output"][0]["content"][0]["text"] (или похожей структуре);
+    # --- Извлекаем текст ---
+    try:
+        raw = data["choices"][0]["message"]["content"]
+        parsed = json.loads(raw)
+        return parsed
+    except Exception:
+        try:
+            fixed = raw.strip().strip("`").strip()
+            return json.loads(fixed)
+        except Exception:
+            print("JSON parse failed. Raw:", raw[:500])
+            return {
+                "steps": [],
+                "mistakes": [],
+                "gaps": [],
+                "drills": [],
+                "summary": "Не удалось распарсить ответ модели. Попробуйте переснять фото."
+            }
+
     # держим защитный парсинг на случай изменений
     def extract_text(res: dict) -> str:
         # попытка 1: новый формат
